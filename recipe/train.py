@@ -76,6 +76,10 @@ class TrainConfig:
     # Logging
     log_every: int = 10
 
+    # LR schedule: "cosine" or "wsd" (warmup-stable-decay: hold max_lr flat, decay only the tail)
+    lr_schedule: str = "cosine"
+    wsd_decay_frac: float = 0.2  # fraction of total_steps spent decaying max_lr -> min_lr
+
     @property
     def grad_accum_steps(self) -> int:
         assert self.batch_size % self.micro_batch_size == 0
@@ -105,6 +109,26 @@ def cosine_lr(step: int, cfg: TrainConfig) -> float:
     progress = (step - cfg.warmup_steps) / max(1, cfg.total_steps - cfg.warmup_steps)
     progress = min(1.0, max(0.0, progress))
     return cfg.min_lr + 0.5 * (cfg.max_lr - cfg.min_lr) * (1 + math.cos(math.pi * progress))
+
+
+def wsd_lr(step: int, cfg: TrainConfig) -> float:
+    """Warmup-Stable-Decay: linear warmup -> hold max_lr flat -> decay the last
+    wsd_decay_frac of steps to min_lr via 1-sqrt (spends most of the budget at the
+    high, most-informative LR; reaches a given loss in fewer tokens than cosine)."""
+    if step < cfg.warmup_steps:
+        return cfg.max_lr * (step + 1) / max(1, cfg.warmup_steps)
+    decay_start = int(cfg.total_steps * (1.0 - cfg.wsd_decay_frac))
+    if step < decay_start:
+        return cfg.max_lr
+    p = (step - decay_start) / max(1, cfg.total_steps - decay_start)
+    p = min(1.0, max(0.0, p))
+    return cfg.min_lr + (cfg.max_lr - cfg.min_lr) * (1.0 - math.sqrt(p))
+
+
+def schedule_lr(step: int, cfg: TrainConfig) -> float:
+    if getattr(cfg, "lr_schedule", "cosine") == "wsd":
+        return wsd_lr(step, cfg)
+    return cosine_lr(step, cfg)
 
 
 def build_model(cfg: TrainConfig) -> RalphBase:
@@ -271,7 +295,7 @@ def train(cfg: TrainConfig, out_dir: Path, use_wandb: bool = False) -> dict:
     tokens_seen = 0
     last_loss = float("nan")
     for step in range(cfg.total_steps):
-        lr = cosine_lr(step, cfg)
+        lr = schedule_lr(step, cfg)
         # Scale each optimizer's per-group base_lr by the schedule fraction so
         # the Muon and AdamW groups keep distinct learning rates.
         lr_frac = lr / cfg.max_lr
